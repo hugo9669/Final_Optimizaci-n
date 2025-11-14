@@ -1,7 +1,7 @@
 import streamlit as st
 import osmnx as ox
 import networkx as nx
-import pulp
+import pulp # Mantenemos PuLP
 import numpy as np
 import pandas as pd
 import folium
@@ -10,7 +10,7 @@ import random
 
 # --- 1. CONFIGURACIÓN INICIAL Y DATOS FICTICIOS ---
 
-# Configuración del área de estudio (Bello, Antioquia - Mismo lugar que las imágenes)
+# Configuración del área de estudio (Bello, Antioquia)
 LATITUDE_CENTRAL = 6.333
 LONGITUDE_CENTRAL = -75.568
 DISTANCIA_KM = 0.5 # Radio para un área de ~1 km²
@@ -22,7 +22,11 @@ TIPOS_AMBULANCIA = {
     'Critica': {'costo_operativo': 500, 'nombre': 'Ambulancia de Cuidados Críticos', 'color': 'red', 'priority': 3},
 }
 
-# --- 2. FUNCIONES DE GENERACIÓN DE DATOS ---
+# --- 2. FUNCIONES AUXILIARES ---
+
+def costo_operativo_fijo(flujos_k):
+    """Calcula el costo operativo fijo total de todos los flujos."""
+    return sum(f['costo_operativo'] for f in flujos_k)
 
 @st.cache_data(show_spinner="Descargando y preparando el grafo vial con OSMnx...")
 def cargar_grafo_inicial():
@@ -43,7 +47,8 @@ def cargar_grafo_inicial():
     G = G.to_undirected().to_directed() 
     
     # Calcular el tiempo de viaje (usando 'length' y velocidad por defecto)
-    G = ox.add_edge_speeds(G)
+    # CORRECCIÓN: Se agrega fallback=30.0 para evitar el error de maxspeed
+    G = ox.add_edge_speeds(G, fallback=30.0)
     G = ox.add_travel_times(G)
 
     # Identificar el nodo central más cercano a la base
@@ -54,20 +59,14 @@ def cargar_grafo_inicial():
 def generar_capacidades_y_costos(G, C_MIN, C_MAX):
     """Genera capacidades viales aleatorias y costos de tiempo actualizados."""
     
-    # Usamos una copia del grafo para no interferir con el original
     H = G.copy()
     
     for u, v, k, data in H.edges(keys=True, data=True):
-        # Generar capacidad vial aleatoria (C_min a C_max)
         capacidad_vial_kmh = random.uniform(C_MIN, C_MAX)
         data['capacidad_vial_kmh'] = capacidad_vial_kmh
         
-        # Calcular el tiempo de viaje (costo) en minutos
-        # Longitud en metros / (Capacidad en km/h * 1000/60)
-        # Nota: Usamos la capacidad simulada como velocidad efectiva
         length_m = data.get('length', 1) 
         if capacidad_vial_kmh > 0:
-            # Tiempo de viaje en minutos
             costo_tiempo_min = (length_m / 1000) / (capacidad_vial_kmh / 60)
         else:
             costo_tiempo_min = float('inf')
@@ -86,7 +85,6 @@ def generar_flujos_emergencia(G, LUGAR_CENTRAL, NUM_EMERGENCIAS, R_MIN, R_MAX):
         tipo = random.choice(list(TIPOS_AMBULANCIA.keys()))
         flujo_data = TIPOS_AMBULANCIA[tipo]
         
-        # Velocidad Requerida (R_i)
         R_k = random.uniform(R_MIN, R_MAX)
         
         flujos_k.append({
@@ -102,10 +100,10 @@ def generar_flujos_emergencia(G, LUGAR_CENTRAL, NUM_EMERGENCIAS, R_MIN, R_MAX):
     return flujos_k
 
 
-# --- 3. MODELO DE OPTIMIZACIÓN MULTIFLUJO (PU L P) ---
+# --- 3. MODELO DE OPTIMIZACIÓN MULTIFLUJO (PULP) ---
 
 def resolver_modelo_multifluido(G, flujos_k):
-    """Implementa y resuelve el modelo de Flujo Multicommodity con Big M."""
+    """Implementa y resuelve el modelo de Flujo Multicommodity con Big M usando PuLP."""
 
     A_keys = list(G.edges(keys=True)) 
     modelo = pulp.LpProblem("Enrutamiento_Ambulancias_Multiflujo", pulp.LpMinimize)
@@ -121,40 +119,42 @@ def resolver_modelo_multifluido(G, flujos_k):
 
     BIG_M = 1000000 # Costo de penalización alto
     costo_total_viaje = []
-    costo_operativo_fijo = 0
     penalizacion_total = []
 
     # --- Restricciones de Enlace (Big M) y Función Objetivo ---
     for flujo in flujos_k:
         flujo_id = flujo['id']
-        costo_operativo_fijo += flujo['costo_operativo']
         
         for u, v, k in A_keys:
-            edge_data = G.edges[(u, v, k)]
-            capacidad_vial_kmh = edge_data.get('capacidad_vial_kmh', 0)
-            costo_tiempo_min = edge_data.get('costo_tiempo_min', 0)
-            R_k = flujo['velocidad_requerida_kmh']
+            # Solo si la variable existe para este flujo y arista
+            if (u, v, k, flujo_id) in variables_x:
+                edge_data = G.edges[(u, v, k)]
+                capacidad_vial_kmh = edge_data.get('capacidad_vial_kmh', 0)
+                costo_tiempo_min = edge_data.get('costo_tiempo_min', 0)
+                R_k = flujo['velocidad_requerida_kmh']
 
-            # 1. Costo normal (minutos de viaje)
-            costo_total_viaje.append(costo_tiempo_min * variables_x[(u, v, k, flujo_id)])
-            
-            # 2. Penalización (Costo Big M)
-            penalizacion_total.append(BIG_M * variables_z[(u, v, k, flujo_id)])
-            
-            # 3. Restricciones de Enlace (Lógica Big M)
-            if R_k > capacidad_vial_kmh:
-                # CASO A: Arista INAPROPIADA (Rk > μij). Forzar Z >= X
-                # Si x_ijk = 1, z_ijk debe ser 1 (penalizado)
-                modelo += variables_z[(u, v, k, flujo_id)] >= variables_x[(u, v, k, flujo_id)], \
-                           f"Penal_Req_Enlace_{u}_{v}_{k}_{flujo_id}"
-            else:
-                # CASO B: Arista APROPIADA (Rk <= μij). Forzar Z = 0
-                # Si la arista cumple, no hay penalización
-                modelo += variables_z[(u, v, k, flujo_id)] == 0, f"Penal_Req_CUMPLIDA_{u}_{v}_{k}_{flujo_id}"
+                # 1. Costo normal (minutos de viaje)
+                costo_total_viaje.append(costo_tiempo_min * variables_x[(u, v, k, flujo_id)])
+                
+                # 2. Penalización (Costo Big M)
+                penalizacion_total.append(BIG_M * variables_z[(u, v, k, flujo_id)])
+                
+                # 3. Restricciones de Enlace (Lógica Big M)
+                if R_k > capacidad_vial_kmh:
+                    # CASO A: Arista INAPROPIADA (Rk > μij). Forzar Z >= X
+                    # Si x_ijk = 1, z_ijk debe ser 1 (penalizado)
+                    modelo += variables_z[(u, v, k, flujo_id)] >= variables_x[(u, v, k, flujo_id)], \
+                               f"Penal_Req_Enlace_{u}_{v}_{k}_{flujo_id}"
+                else:
+                    # CASO B: Arista APROPIADA (Rk <= μij). Forzar Z = 0
+                    modelo += variables_z[(u, v, k, flujo_id)] == 0, f"Penal_Req_CUMPLIDA_{u}_{v}_{k}_{flujo_id}"
 
 
+    # Costo operativo fijo
+    costo_op_fijo = costo_operativo_fijo(flujos_k)
+    
     # --- Función Objetivo Final ---
-    modelo += pulp.lpSum(costo_total_viaje) + pulp.lpSum(penalizacion_total) + costo_operativo_fijo, "Costo_Total_Minimo"
+    modelo += pulp.lpSum(costo_total_viaje) + pulp.lpSum(penalizacion_total) + costo_op_fijo, "Costo_Total_Minimo"
 
     # --- Restricciones de Conservación de Flujo ---
     for flujo in flujos_k:
@@ -187,9 +187,10 @@ def resolver_modelo_multifluido(G, flujos_k):
             
     # --- Solución ---
     try:
-        modelo.solve(pulp.PULP_CBC_CMD(msg=0)) # Silenciar el output del solver
+        # Usa el solver predeterminado con msg=0 para silenciar el output
+        modelo.solve(pulp.PULP_CBC_CMD(msg=0)) 
         
-        if modelo.status == 1: # Optimal
+        if modelo.status == pulp.LpStatus["Optimal"]: 
             rutas_optimas = {}
             total_tiempo_viaje = pulp.value(pulp.lpSum(costo_total_viaje))
             total_penalizacion = pulp.value(pulp.lpSum(penalizacion_total))
@@ -201,14 +202,18 @@ def resolver_modelo_multifluido(G, flujos_k):
                         rutas_optimas[flujo_id] = []
                     rutas_optimas[flujo_id].append((u, v, k))
             
-            return rutas_optimas, modelo.status, pulp.value(modelo.objective), total_tiempo_viaje, total_penalizacion
+            # Usamos 1 para estado Optimal, igual que en el código anterior.
+            return rutas_optimas, 1, pulp.value(modelo.objective), total_tiempo_viaje, total_penalizacion, costo_op_fijo
         
+        elif modelo.status == pulp.LpStatus["Infeasible"]:
+            return {}, -1, None, None, None, costo_op_fijo
+            
         else:
-            return {}, modelo.status, None, None, None
+            return {}, -3, None, None, None, costo_op_fijo
             
     except Exception as e:
-        st.error(f"Error grave al resolver el modelo: {e}")
-        return {}, -2, None, None, None
+        st.error(f"Error grave al resolver el modelo. Asegúrese de que el solver CBC esté instalado. Error: {e}")
+        return {}, -2, None, None, None, costo_op_fijo
 
 
 # --- 4. FUNCIONES DE VISUALIZACIÓN ---
@@ -216,17 +221,18 @@ def resolver_modelo_multifluido(G, flujos_k):
 def dibujar_rutas_en_mapa(G, flujos_data, rutas_optimas):
     """Dibuja el grafo, el origen, los destinos y las rutas óptimas con Folium."""
     
-    # Obtener coordenadas del centro para inicializar el mapa
-    center_lat = G.nodes[flujos_data[0]['origen']]['y']
-    center_lon = G.nodes[flujos_data[0]['origen']]['x']
+    s_node = flujos_data[0]['origen']
+    if s_node not in G.nodes:
+        st.error("Error de datos: El nodo de origen no se encontró en el grafo.")
+        return {} 
+        
+    center_lat = G.nodes[s_node]['y']
+    center_lon = G.nodes[s_node]['x']
     
-    # Crear el mapa de Folium
     m = folium.Map(location=[center_lat, center_lon], zoom_start=14, tiles="cartodbpositron")
     
-    # Dibujar todas las calles del grafo (fondo)
     ox.plot_graph_folium(G, graph_map=m, edge_width=0.5, edge_color='#CCCCCC', node_size=0, popup_attribute=None)
     
-    # Diccionario para almacenar información de la ruta
     ruta_info = {}
 
     for flujo in flujos_data:
@@ -240,22 +246,27 @@ def dibujar_rutas_en_mapa(G, flujos_data, rutas_optimas):
             tipo_urgencia = flujo['tipo_urgencia']
             flujo_color = flujo['color']
             
-            # --- 4.1 Dibujar la Ruta Óptima ---
+            tiempo_ruta_acumulado = 0
+            aristas_violadas_contador = 0
+            
             for u, v, k in ruta:
                 
-                # Obtener la data de la arista
                 edge_data = G.edges[(u, v, k)]
                 μ_ij = edge_data['capacidad_vial_kmh']
                 costo_min = edge_data['costo_tiempo_min']
                 
-                # Coordenadas de los nodos
-                u_lat, u_lon = G.nodes[u]['y'], G.nodes[u]['x']
-                v_lat, v_lon = G.nodes[v]['y'], G.nodes[v]['x']
+                if u in G.nodes and v in G.nodes:
+                    u_lat, u_lon = G.nodes[u]['y'], G.nodes[u]['x']
+                    v_lat, v_lon = G.nodes[v]['y'], G.nodes[v]['x']
+                else:
+                    continue
 
-                # Verificar si se violó la restricción de velocidad
                 violacion = "❌ Violada (Rk > μij)" if R_k > μ_ij else "✅ Cumplida"
-
-                # Información para el popup
+                if R_k > μ_ij:
+                    aristas_violadas_contador += 1
+                
+                tiempo_ruta_acumulado += costo_min
+                
                 popup_html = f"""
                 <b>Flujo:</b> {flujo_id} ({tipo_urgencia})<br>
                 <b>Requerida (Rk):</b> {R_k:.1f} km/h<br>
@@ -264,7 +275,6 @@ def dibujar_rutas_en_mapa(G, flujos_data, rutas_optimas):
                 <b>Costo:</b> {costo_min:.2f} min
                 """
                 
-                # Dibujar la arista
                 folium.PolyLine(
                     locations=[(u_lat, u_lon), (v_lat, v_lon)],
                     color=flujo_color,
@@ -273,29 +283,26 @@ def dibujar_rutas_en_mapa(G, flujos_data, rutas_optimas):
                     tooltip=flujo_id,
                 ).add_child(folium.Popup(popup_html)).add_to(m)
 
-                # Almacenar info detallada
-                if flujo_id not in ruta_info: ruta_info[flujo_id] = {'tiempo_total': 0, 'aristas_violadas': 0, 'tipo': tipo_urgencia, 'Rk': R_k, 'ruta': []}
-                
-                ruta_info[flujo_id]['tiempo_total'] += costo_min
-                if R_k > μ_ij:
-                    ruta_info[flujo_id]['aristas_violadas'] += 1
-
+            ruta_info[flujo_id] = {
+                'tiempo_total': tiempo_ruta_acumulado, 
+                'aristas_violadas': aristas_violadas_contador, 
+                'tipo': tipo_urgencia, 
+                'Rk': R_k, 
+                'costo_operativo': flujo['costo_operativo']
+            }
             
-            # --- 4.2 Marcador de Origen (Base) ---
             folium.Marker(
                 location=[G.nodes[s]['y'], G.nodes[s]['x']],
                 popup=f"BASE: {s} - Centro de Ambulancias",
                 icon=folium.Icon(color='blue', icon='fa-ambulance', prefix='fa')
             ).add_to(m)
             
-            # --- 4.3 Marcador de Destino (Incidente) ---
             folium.Marker(
                 location=[G.nodes[d_k]['y'], G.nodes[d_k]['x']],
                 popup=f"DESTINO: {d_k} - Emergencia {flujo_id} ({tipo_urgencia})",
                 icon=folium.Icon(color=flujo_color, icon='fa-hospital', prefix='fa')
             ).add_to(m)
             
-    # Mostrar el mapa en Streamlit
     folium_static(m)
     
     return ruta_info
@@ -308,61 +315,57 @@ def main():
     st.title("🚑 Modelo de Enrutamiento Multiflujo (Ambulancias)")
     st.caption("Implementación de Flujo Multicommodity con PuLP y OSMnx.")
     
-    # 5.1 CARGAR GRAFO Y MANEJAR ESTADO INICIAL
-    G_base, LUGAR_CENTRAL = cargar_grafo_inicial()
+    try:
+        G_base, LUGAR_CENTRAL = cargar_grafo_inicial()
+    except Exception as e:
+        st.error(f"Error al cargar el grafo OSMnx. Por favor, revise las dependencias de OSMnx. Error: {e}")
+        return
 
-    # Inicializar el estado de la aplicación
     if 'G_actual' not in st.session_state:
         
-        # 1. Asignar parámetros por defecto y generar capacidades iniciales
         R_MIN_DEFAULT = 30.0
         R_MAX_DEFAULT = 80.0
         C_MIN_DEFAULT = 40.0
         C_MAX_DEFAULT = 120.0
+        NUM_EMERGENCIAS_DEFAULT = 5
         
         G_with_capacity = generar_capacidades_y_costos(
             G_base, C_MIN_DEFAULT, C_MAX_DEFAULT
         )
 
         st.session_state.G_actual = G_with_capacity
-        st.session_state.num_emergencias = 5 # Valor por defecto
+        st.session_state.num_emergencias = NUM_EMERGENCIAS_DEFAULT
         st.session_state.R_MIN = R_MIN_DEFAULT
         st.session_state.R_MAX = R_MAX_DEFAULT
         st.session_state.C_MIN = C_MIN_DEFAULT
         st.session_state.C_MAX = C_MAX_DEFAULT
         
-        # 2. Generar los flujos iniciales
         st.session_state.flujos_k = generar_flujos_emergencia(
-            st.session_state.G_actual, LUGAR_CENTRAL, st.session_state.num_emergencias, 
-            st.session_state.R_MIN, st.session_state.R_MAX
+            st.session_state.G_actual, LUGAR_CENTRAL, NUM_EMERGENCIAS_DEFAULT, 
+            R_MIN_DEFAULT, R_MAX_DEFAULT
         )
         
     G_actual = st.session_state.G_actual
     
-    # 5.2 BARRA LATERAL DE CONFIGURACIÓN
     st.sidebar.header("⚙️ Configuración del Modelo")
 
-    # Controles de Flujo (R)
     st.sidebar.subheader("Requerimientos de Velocidad (Rᵢ)")
-    st.session_state.R_MIN = st.sidebar.slider("R_MÍN (km/h)", 10.0, 100.0, st.session_state.R_MIN, 5.0)
-    st.session_state.R_MAX = st.sidebar.slider("R_MÁX (km/h)", 50.0, 150.0, st.session_state.R_MAX, 5.0)
+    st.session_state.R_MIN = st.sidebar.slider("R_MÍN (km/h)", 10.0, 100.0, st.session_state.R_MIN, 5.0, key='r_min_slider')
+    st.session_state.R_MAX = st.sidebar.slider("R_MÁX (km/h)", 50.0, 150.0, st.session_state.R_MAX, 5.0, key='r_max_slider')
     
-    # Controles de Capacidad (C)
     st.sidebar.subheader("Capacidades Viales (μᵢⱼ)")
-    st.session_state.C_MIN = st.sidebar.slider("C_MÍN (km/h)", 10.0, 100.0, st.session_state.C_MIN, 5.0)
-    st.session_state.C_MAX = st.sidebar.slider("C_MÁX (km/h)", 50.0, 150.0, st.session_state.C_MAX, 5.0)
+    st.session_state.C_MIN = st.sidebar.slider("C_MÍN (km/h)", 10.0, 100.0, st.session_state.C_MIN, 5.0, key='c_min_slider')
+    st.session_state.C_MAX = st.sidebar.slider("C_MÁX (km/h)", 50.0, 150.0, st.session_state.C_MAX, 5.0, key='c_max_slider')
 
-    # Control de Número de Emergencias
     st.session_state.num_emergencias = st.sidebar.number_input(
         "Número de Emergencias (Flujos)", 
         min_value=1, 
         max_value=10, 
         value=st.session_state.num_emergencias, 
-        step=1
+        step=1,
+        key='num_emergencias_input'
     )
 
-    # 5.3 LÓGICA DE BOTONES Y ACCIONES
-    
     col_cap, col_flujo = st.sidebar.columns(2)
     
     if col_cap.button("🔄 Recalcular Capacidades", key='recalc_cap'):
@@ -370,55 +373,66 @@ def main():
             st.session_state.G_actual = generar_capacidades_y_costos(
                 G_base, st.session_state.C_MIN, st.session_state.C_MAX
             )
-        st.sidebar.success("Capacidades actualizadas.")
+        st.sidebar.success("Capacidades actualizadas. Presione 'Optimizar' para usar las nuevas capacidades.")
 
     if col_flujo.button("📍 Recalcular Flujos/Destinos", key='recalc_flujo'):
         with st.spinner("Generando nuevos flujos y destinos..."):
             st.session_state.flujos_k = generar_flujos_emergencia(
-                st.session_state.G_actual, LUGAR_CENTRAL, st.session_state.num_emergencias, 
+                G_base, LUGAR_CENTRAL, st.session_state.num_emergencias, 
                 st.session_state.R_MIN, st.session_state.R_MAX
             )
-        st.sidebar.success("Flujos/Emergencias reasignados.")
+            st.session_state.G_actual = generar_capacidades_y_costos(
+                G_base, st.session_state.C_MIN, st.session_state.C_MAX
+            )
+        st.sidebar.success("Flujos/Emergencias reasignados. Presione 'Optimizar' para usar los nuevos flujos.")
 
-    # 5.4 EJECUCIÓN DEL MODELO Y VISUALIZACIÓN DE RESULTADOS
-    
     st.header("1. Mapa de Rutas Óptimas")
     
-    # Botón principal para ejecutar el solver
-    if st.button("🚀 Optimizar y Mostrar Rutas (Ejecutar Modelo)", type="primary"):
+    if st.button("🚀 Optimizar y Mostrar Rutas (Ejecutar Modelo)", type="primary", key='optimizar_button'):
         
-        # Ejecutar el modelo
         with st.spinner("Resolviendo el modelo de optimización PuLP (Flujo Multicommodity)..."):
-            rutas_optimas, status, costo_total_minimo, total_tiempo_viaje, total_penalizacion = \
+            rutas_optimas, status, costo_total_minimo, total_tiempo_viaje, total_penalizacion, costo_op_fijo_calc = \
                 resolver_modelo_multifluido(st.session_state.G_actual, st.session_state.flujos_k)
         
-        # 5.4.1 VISUALIZACIÓN DE RESULTADOS
+        st.session_state.rutas_optimas = rutas_optimas
+        st.session_state.status = status
+        st.session_state.costo_total_minimo = costo_total_minimo
+        st.session_state.total_tiempo_viaje = total_tiempo_viaje
+        st.session_state.total_penalizacion = total_penalizacion
+        st.session_state.costo_op_fijo = costo_op_fijo_calc
+        st.session_state.show_results = True
         
+    
+    if 'show_results' in st.session_state and st.session_state.show_results:
+        
+        status = st.session_state.status
+        costo_total_minimo = st.session_state.costo_total_minimo
+        rutas_optimas = st.session_state.rutas_optimas
+        total_tiempo_viaje = st.session_state.total_tiempo_viaje
+        total_penalizacion = st.session_state.total_penalizacion
+        costo_op_fijo = st.session_state.costo_op_fijo
+
         if status == 1: # Optimal
             st.success(f"✅ Modelo Resuelto: ÓPTIMO (Costo Total: ${costo_total_minimo:.2f})")
             
-            # Dibujar en el mapa
             ruta_info = dibujar_rutas_en_mapa(st.session_state.G_actual, st.session_state.flujos_k, rutas_optimas)
 
-            # 5.4.2 Dashboard de Métricas
             st.header("2. Métricas y Análisis")
             
             col1, col2, col3 = st.columns(3)
             
-            # Columna 1: Costo Total
             col1.metric(
                 "Costo Total Mínimo", 
                 f"${costo_total_minimo:.2f}", 
                 "Tiempo + Operación + Penalización"
             )
-            # Columna 2: Tiempo de Viaje
             col2.metric(
                 "Tiempo de Viaje (Σ Minutos)", 
                 f"{total_tiempo_viaje:.2f} min", 
-                f"Costo Operativo Fijo: ${costo_operativo_fijo(st.session_state.flujos_k):.2f}"
+                f"Costo Operativo Fijo: ${costo_op_fijo:.2f}"
             )
-            # Columna 3: Penalización
-            if total_penalizacion > 0:
+            
+            if total_penalizacion is not None and total_penalizacion > 0:
                 col3.metric(
                     "Costo de Penalización (Big M)", 
                     f"${total_penalizacion:,.0f}", 
@@ -431,19 +445,16 @@ def main():
                     "Todas las rutas cumplieron Rk"
                 )
 
-
-            # 5.4.3 Tabla de Análisis de Flujos
             st.subheader("3. Detalle por Flujo (Emergencia)")
             
             datos_tabla = []
-            for flujo_id, info in ruta_info.items():
+            for info in ruta_info.values():
                 datos_tabla.append({
-                    "Flujo ID": flujo_id,
                     "Urgencia": info['tipo'],
                     "R_Requerida (km/h)": f"{info['Rk']:.1f}",
                     "Tiempo Ruta (min)": f"{info['tiempo_total']:.2f}",
                     "Aristas Violadas": info['aristas_violadas'],
-                    "Costo Operativo": TIPOS_AMBULANCIA[info['tipo']]['costo_operativo']
+                    "Costo Operativo": info['costo_operativo']
                 })
 
             df_resultados = pd.DataFrame(datos_tabla)
@@ -451,8 +462,12 @@ def main():
 
         elif status == -1:
             st.error("❌ El modelo no encontró una solución (Infactible). Esto solo puede ocurrir si Origen y Destino están desconectados en el grafo original.")
+        elif status == -2:
+             st.error("❌ Error de ejecución del solver. Por favor, revise la configuración de su entorno.")
+        elif status == -3:
+             st.warning(f"El solver terminó con el estado: {pulp.LpStatus[status]}. Intente recalcular.")
         else:
-            st.warning(f"El solver terminó con el estado: {pulp.LpStatus[status]}. Intente recalcular.")
+            st.warning(f"El solver terminó con un estado inesperado: {status}. Intente recalcular.")
         
     st.subheader("Información de la Red")
     colA, colB, colC = st.columns(3)
@@ -460,9 +475,6 @@ def main():
     colB.metric("Aristas", len(G_actual.edges))
     colC.metric("Base Central", LUGAR_CENTRAL)
     
-
-def costo_operativo_fijo(flujos_k):
-    return sum(f['costo_operativo'] for f in flujos_k)
 
 if __name__ == '__main__':
     main()
