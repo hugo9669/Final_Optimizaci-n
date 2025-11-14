@@ -3,4 +3,6 @@ libproj-dev
 libgdal-dev
 libspatialindex-dev
 coinor-cbc
-unixodbc
+libodbc2
+libodbcinst2
+unixodbc-common
