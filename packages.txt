@@ -1,1 +1,5 @@
 coinor-cbc
+libspatialindex-dev
+libgdal-dev
+libproj-dev
+build-essential
