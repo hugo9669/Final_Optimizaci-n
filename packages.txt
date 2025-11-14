@@ -3,3 +3,5 @@ libproj-dev
 libgdal-dev
 libspatialindex-dev
 coinor-cbc
+libodbc2
+libodbcinst2
