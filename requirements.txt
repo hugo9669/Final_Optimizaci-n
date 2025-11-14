@@ -1,8 +1,8 @@
 streamlit
-osmnx
 networkx
 pulp
 numpy
 pandas
 folium
 streamlit-folium
+
