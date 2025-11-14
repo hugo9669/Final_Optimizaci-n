@@ -1,5 +1,5 @@
 import streamlit as st
-import osmnx as ox
+# import osmnx as ox # Ya no se usa directamente
 import networkx as nx
 import pulp # Mantenemos PuLP
 import numpy as np
@@ -28,33 +28,47 @@ def costo_operativo_fijo(flujos_k):
     """Calcula el costo operativo fijo total de todos los flujos."""
     return sum(f['costo_operativo'] for f in flujos_k)
 
-@st.cache_data(show_spinner="Descargando y preparando el grafo vial con OSMnx...")
+@st.cache_data(show_spinner="Simulando y preparando el grafo vial...")
 def cargar_grafo_inicial():
-    """Descarga el grafo vial de OSMnx y calcula el tiempo de viaje."""
+    """Crea un grafo simulado de NetworkX con atributos necesarios para la optimización y visualización."""
     
-    # Descargar el grafo vial como MultiDiGraph
-    G = ox.graph_from_point(
-        (LATITUDE_CENTRAL, LONGITUDE_CENTRAL), 
-        dist=DISTANCIA_KM * 1000, # Convertir a metros
-        network_type="drive", 
-        retain_all=True
-    )
-
-    # Proyectar el grafo
-    G = ox.project_graph(G)
-
-    # Convertir a MultiDiGraph (Asegura las claves)
-    G = G.to_undirected().to_directed() 
+    # === SIMULACIÓN DE GRAFO (Reemplaza a OSMnx) ===
+    G = nx.MultiDiGraph()
     
-    # Calcular el tiempo de viaje (usando 'length' y velocidad por defecto)
-    # CORRECCIÓN: Se agrega fallback=30.0 para evitar el error de maxspeed
-    G = ox.add_edge_speeds(G, fallback=30.0)
-    G = ox.add_travel_times(G)
+    # Crear 10 nodos con coordenadas simuladas
+    nodos = [i + 1 for i in range(10)]
+    coords = {}
+    
+    # Coordenadas alrededor del punto central para visualización
+    base_lat = LATITUDE_CENTRAL
+    base_lon = LONGITUDE_CENTRAL
+    
+    for i in nodos:
+        lat = base_lat + random.uniform(-0.005, 0.005)
+        lon = base_lon + random.uniform(-0.005, 0.005)
+        coords[i] = {'y': lat, 'x': lon}
+        G.add_node(i, y=lat, x=lon)
 
-    # Identificar el nodo central más cercano a la base
-    LUGAR_CENTRAL = ox.nearest_nodes(G, LONGITUDE_CENTRAL, LATITUDE_CENTRAL)
+    # Agregar aristas simuladas con atributos
+    aristas = [
+        (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9), (9, 10),
+        (1, 4), (2, 5), (3, 6), (4, 7), (5, 8), (6, 9), (7, 10), (1, 10), (3, 8)
+    ]
+    
+    for u, v in aristas:
+        # Añadir arista de ida
+        length_m = random.uniform(50, 500)
+        G.add_edge(u, v, key=0, length=length_m, travel_time=(length_m / 1000) / (60 / 60))
+        # Añadir arista de vuelta (bidireccionalidad)
+        length_m = random.uniform(50, 500)
+        G.add_edge(v, u, key=0, length=length_m, travel_time=(length_m / 1000) / (60 / 60))
+
+    # El nodo central será el nodo 1
+    LUGAR_CENTRAL = 1
     
     return G, LUGAR_CENTRAL
+    # === FIN SIMULACIÓN DE GRAFO ===
+
 
 def generar_capacidades_y_costos(G, C_MIN, C_MAX):
     """Genera capacidades viales aleatorias y costos de tiempo actualizados."""
@@ -67,6 +81,7 @@ def generar_capacidades_y_costos(G, C_MIN, C_MAX):
         
         length_m = data.get('length', 1) 
         if capacidad_vial_kmh > 0:
+            # Cálculo de costo_tiempo_min (tiempo de viaje) basado en la capacidad
             costo_tiempo_min = (length_m / 1000) / (capacidad_vial_kmh / 60)
         else:
             costo_tiempo_min = float('inf')
@@ -78,7 +93,14 @@ def generar_capacidades_y_costos(G, C_MIN, C_MAX):
 def generar_flujos_emergencia(G, LUGAR_CENTRAL, NUM_EMERGENCIAS, R_MIN, R_MAX):
     """Genera flujos de emergencia con origen, destino y velocidad requerida."""
     
-    nodos_destino = random.sample(list(G.nodes), NUM_EMERGENCIAS)
+    # Aseguramos que el origen (BASE) no sea un destino
+    nodos_disponibles = [n for n in G.nodes if n != LUGAR_CENTRAL]
+    
+    # Aseguramos que el número de destinos no exceda los nodos disponibles
+    if NUM_EMERGENCIAS > len(nodos_disponibles):
+        NUM_EMERGENCIAS = len(nodos_disponibles)
+        
+    nodos_destino = random.sample(nodos_disponibles, NUM_EMERGENCIAS)
     flujos_k = []
 
     for i, d_k in enumerate(nodos_destino):
@@ -164,12 +186,14 @@ def resolver_modelo_multifluido(G, flujos_k):
 
         for i in G.nodes:
             # Flujo saliente: (i, j, k, flujo_id)
+            # Aseguramos que 'get' devuelva 0 si la variable no existe
             flujo_saliente = [variables_x.get((i, j, m, flujo_id), 0) 
                               for j in G.neighbors(i) 
                               for m in G.get_edge_data(i, j, default={}) 
                               if (i, j, m, flujo_id) in variables_x]
 
             # Flujo entrante: (j, i, k, flujo_id)
+            # Aseguramos que 'get' devuelva 0 si la variable no existe
             flujo_entrante = [variables_x.get((j, i, m, flujo_id), 0) 
                               for j in G.predecessors(i) 
                               for m in G.get_edge_data(j, i, default={}) 
@@ -209,9 +233,11 @@ def resolver_modelo_multifluido(G, flujos_k):
             return {}, -1, None, None, None, costo_op_fijo
             
         else:
+            # -3 es un valor de estado distinto de Optimal/Infeasible
             return {}, -3, None, None, None, costo_op_fijo
             
     except Exception as e:
+        # Error grave del solver (e.g., PuLP no encontró CBC)
         st.error(f"Error grave al resolver el modelo. Asegúrese de que el solver CBC esté instalado. Error: {e}")
         return {}, -2, None, None, None, costo_op_fijo
 
@@ -223,18 +249,49 @@ def dibujar_rutas_en_mapa(G, flujos_data, rutas_optimas):
     
     s_node = flujos_data[0]['origen']
     if s_node not in G.nodes:
-        st.error("Error de datos: El nodo de origen no se encontró en el grafo.")
+        # En el grafo simulado, esto no debería pasar si LUGAR_CENTRAL = 1
+        st.error("Error de datos: El nodo de origen no se encontró en el grafo.") 
         return {} 
         
+    # Usar las coordenadas del nodo central para centrar el mapa
     center_lat = G.nodes[s_node]['y']
     center_lon = G.nodes[s_node]['x']
     
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=14, tiles="cartodbpositron")
-    
-    ox.plot_graph_folium(G, graph_map=m, edge_width=0.5, edge_color='#CCCCCC', node_size=0, popup_attribute=None)
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=15, tiles="cartodbpositron")
     
     ruta_info = {}
+    
+    # 1. Dibujar todos los nodos (puntos) y aristas (líneas grises)
+    
+    # Dibujar Nodos
+    for node, data in G.nodes(data=True):
+        if 'y' in data and 'x' in data:
+             folium.CircleMarker(
+                location=[data['y'], data['x']],
+                radius=3,
+                color='#666666',
+                fill=True,
+                fill_color='#AAAAAA',
+                fill_opacity=0.7,
+                tooltip=f"Nodo {node}"
+            ).add_to(m)
 
+    # Dibujar Aristas de Fondo (Simuladas)
+    for u, v, k, data in G.edges(keys=True, data=True):
+        u_lat, u_lon = G.nodes[u]['y'], G.nodes[u]['x']
+        v_lat, v_lon = G.nodes[v]['y'], G.nodes[v]['x']
+        
+        # Evitar dibujar dos veces la misma línea para grafo bidireccional
+        if u < v:
+             folium.PolyLine(
+                locations=[(u_lat, u_lon), (v_lat, v_lon)],
+                color='#CCCCCC',
+                weight=1,
+                opacity=0.5
+            ).add_to(m)
+
+
+    # 2. Dibujar las Rutas Optimas y Marcadores
     for flujo in flujos_data:
         flujo_id = flujo['id']
         
@@ -249,17 +306,19 @@ def dibujar_rutas_en_mapa(G, flujos_data, rutas_optimas):
             tiempo_ruta_acumulado = 0
             aristas_violadas_contador = 0
             
+            # Dibujar Aristas de la Ruta
             for u, v, k in ruta:
                 
+                # Manejo de Nodos en el Grafo Simulado
+                if u not in G.nodes or v not in G.nodes or 'y' not in G.nodes[u]:
+                    continue
+                    
                 edge_data = G.edges[(u, v, k)]
                 μ_ij = edge_data['capacidad_vial_kmh']
                 costo_min = edge_data['costo_tiempo_min']
                 
-                if u in G.nodes and v in G.nodes:
-                    u_lat, u_lon = G.nodes[u]['y'], G.nodes[u]['x']
-                    v_lat, v_lon = G.nodes[v]['y'], G.nodes[v]['x']
-                else:
-                    continue
+                u_lat, u_lon = G.nodes[u]['y'], G.nodes[u]['x']
+                v_lat, v_lon = G.nodes[v]['y'], G.nodes[v]['x']
 
                 violacion = "❌ Violada (Rk > μij)" if R_k > μ_ij else "✅ Cumplida"
                 if R_k > μ_ij:
@@ -269,6 +328,7 @@ def dibujar_rutas_en_mapa(G, flujos_data, rutas_optimas):
                 
                 popup_html = f"""
                 <b>Flujo:</b> {flujo_id} ({tipo_urgencia})<br>
+                <b>Origen/Destino:</b> {u} -> {v}<br>
                 <b>Requerida (Rk):</b> {R_k:.1f} km/h<br>
                 <b>Capacidad (μij):</b> {μ_ij:.1f} km/h<br>
                 <b>Restricción:</b> {violacion}<br>
@@ -278,11 +338,12 @@ def dibujar_rutas_en_mapa(G, flujos_data, rutas_optimas):
                 folium.PolyLine(
                     locations=[(u_lat, u_lon), (v_lat, v_lon)],
                     color=flujo_color,
-                    weight=4,
-                    opacity=0.8,
+                    weight=5, # Más grueso para ruta optimizada
+                    opacity=0.9,
                     tooltip=flujo_id,
                 ).add_child(folium.Popup(popup_html)).add_to(m)
 
+            # Recopilación de Info de Ruta
             ruta_info[flujo_id] = {
                 'tiempo_total': tiempo_ruta_acumulado, 
                 'aristas_violadas': aristas_violadas_contador, 
@@ -291,12 +352,14 @@ def dibujar_rutas_en_mapa(G, flujos_data, rutas_optimas):
                 'costo_operativo': flujo['costo_operativo']
             }
             
+            # Marcador de Origen (Base)
             folium.Marker(
                 location=[G.nodes[s]['y'], G.nodes[s]['x']],
                 popup=f"BASE: {s} - Centro de Ambulancias",
                 icon=folium.Icon(color='blue', icon='fa-ambulance', prefix='fa')
             ).add_to(m)
             
+            # Marcador de Destino (Emergencia)
             folium.Marker(
                 location=[G.nodes[d_k]['y'], G.nodes[d_k]['x']],
                 popup=f"DESTINO: {d_k} - Emergencia {flujo_id} ({tipo_urgencia})",
@@ -312,13 +375,17 @@ def dibujar_rutas_en_mapa(G, flujos_data, rutas_optimas):
 def main():
     st.set_page_config(layout="wide", page_title="Modelo de Enrutamiento Multiflujo para Ambulancias")
 
-    st.title("🚑 Modelo de Enrutamiento Multiflujo (Ambulancias)")
-    st.caption("Implementación de Flujo Multicommodity con PuLP y OSMnx.")
+    st.title("🚑 Modelo de Enrutamiento Multiflujo (Ambulancias) - [Simulado]")
+    st.caption("Implementación de Flujo Multicommodity con PuLP en un grafo de red simulado para evitar conflictos de OSMnx.")
     
     try:
+        # Carga del grafo simulado
         G_base, LUGAR_CENTRAL = cargar_grafo_inicial()
+        # Nota: LUGAR_CENTRAL = 1 en el grafo simulado
+        
     except Exception as e:
-        st.error(f"Error al cargar el grafo OSMnx. Por favor, revise las dependencias de OSMnx. Error: {e}")
+        # Este error solo debería ocurrir si NetworkX falla.
+        st.error(f"Error al inicializar NetworkX. Error: {e}")
         return
 
     if 'G_actual' not in st.session_state:
@@ -327,7 +394,8 @@ def main():
         R_MAX_DEFAULT = 80.0
         C_MIN_DEFAULT = 40.0
         C_MAX_DEFAULT = 120.0
-        NUM_EMERGENCIAS_DEFAULT = 5
+        # Reducimos el número de emergencias para el grafo simulado pequeño (máx 9 destinos)
+        NUM_EMERGENCIAS_DEFAULT = 3 
         
         G_with_capacity = generar_capacidades_y_costos(
             G_base, C_MIN_DEFAULT, C_MAX_DEFAULT
@@ -360,7 +428,7 @@ def main():
     st.session_state.num_emergencias = st.sidebar.number_input(
         "Número de Emergencias (Flujos)", 
         min_value=1, 
-        max_value=10, 
+        max_value=9, # Máximo 9 destinos en el grafo simulado (10 nodos - 1 base)
         value=st.session_state.num_emergencias, 
         step=1,
         key='num_emergencias_input'
@@ -469,11 +537,11 @@ def main():
         else:
             st.warning(f"El solver terminó con un estado inesperado: {status}. Intente recalcular.")
         
-    st.subheader("Información de la Red")
+    st.subheader("Información de la Red Simulada")
     colA, colB, colC = st.columns(3)
     colA.metric("Nodos", len(G_actual.nodes))
     colB.metric("Aristas", len(G_actual.edges))
-    colC.metric("Base Central", LUGAR_CENTRAL)
+    colC.metric("Base Central (Nodo)", LUGAR_CENTRAL)
     
 
 if __name__ == '__main__':
