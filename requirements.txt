@@ -6,5 +6,3 @@ numpy
 pandas
 folium
 streamlit-folium
-geopandas 
-Rtree
